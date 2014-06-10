@@ -45,6 +45,7 @@ module S3Proxy
         io.write "Connection: close\r\n"
         io.write "Content-Type: #{head.content_type}\r\n"
         io.write "Content-Length: #{head.content_length}\r\n"
+        io.write "ETag: #{head.etag}\r\n"
         io.write "\r\n"
         io.flush
 
