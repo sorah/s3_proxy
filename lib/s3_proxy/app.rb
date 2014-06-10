@@ -11,7 +11,13 @@ module S3Proxy
       return Errors.method_not_allowed unless env['REQUEST_METHOD'] == 'GET'
       return Errors.not_found if env['PATH_INFO'].empty?
 
-      _, bucket, key = env['PATH_INFO'].split('/', 3)
+      # When used as a forward proxy
+      if env['HTTP_HOST'] =~ /(.+)\.s3\.amazonaws\.com/
+        bucket = $1
+        _, key = env['PATH_INFO'].split('/', 2)
+      else
+        _, bucket, key = env['PATH_INFO'].split('/', 3)
+      end
       path = {bucket: bucket, key: key}
 
       head = s3.head_object(path)
