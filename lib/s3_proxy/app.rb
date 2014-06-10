@@ -12,14 +12,15 @@ module S3Proxy
       return Errors.not_found if env['PATH_INFO'].empty?
 
       _, bucket, key = env['PATH_INFO'].split('/', 3)
+      path = {bucket: bucket, key: key}
 
-      head = s3.head_object(bucket: bucket, key: key)
+      head = s3.head_object(path)
       return Errors.not_found unless head
 
       if env['rack.hijack?']
-        hijack env
+        hijack env, path, head
       else
-        gentle env
+        gentle env, path, head
       end
 
     rescue Aws::S3::Errors::NoSuchKey
@@ -28,7 +29,7 @@ module S3Proxy
 
     private
 
-    def hijack(env)
+    def hijack(env, path, head)
       env['rack.hijack'].call
 
       io = env['rack.hijack_io']
@@ -41,18 +42,16 @@ module S3Proxy
         io.write "\r\n"
         io.flush
 
-        s3.get_object({bucket: bucket, key: key}, target: io)
+        s3.get_object(path, target: io)
       ensure
         io.close
       end
       return [200, {}, ['']]
     end
 
-    def gentle(env)
-      sio = StringIO.new('','w+')
-
+    def gentle(env, path, head)
       fiber = Fiber.new do
-        s3.get_object(bucket: bucket, key: key) do |chunk|
+        s3.get_object(path) do |chunk|
           Fiber.yield(chunk)
         end
         Fiber.yield(nil)
