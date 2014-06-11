@@ -21,29 +21,47 @@ module S3Proxy
 
       return Errors.not_found unless bucket && key
 
-      path = {bucket: bucket, key: key}
+      req = {bucket: bucket, key: key}
 
-      head = s3.head_object(path)
+      req[:if_match] = env['HTTP_IF_MATCH'] if env['HTTP_IF_MATCH']
+      req[:if_none_match] = env['HTTP_IF_NONE_MATCH'] if env['HTTP_IF_NONE_MATCH']
+      req[:if_modified_since] = env['HTTP_IF_MODIFIED_SINCE'] if env['HTTP_IF_MODIFIED_SINCE']
+      req[:if_unmodified_since] = env['HTTP_IF_UNMODIFIED_SINCE'] if env['HTTP_UNMODIFIED_SINCE']
+
+      head = s3.head_object(req)
 
       return Errors.not_found unless head
 
       case env['REQUEST_METHOD']
       when 'HEAD'
-        gentle env, path, head
+        gentle env, req, head
       when 'GET'
         if env['rack.hijack?']
-          hijack env, path, head
+          hijack env, req, head
         else
-          gentle env, path, head
+          gentle env, req, head
         end
       end
+
     rescue Aws::S3::Errors::NoSuchKey, Aws::S3::Errors::NotFound
       return Errors.not_found
+
+    rescue Aws::S3::Errors::NotModified
+      return Errors.not_modified
+
+    rescue Aws::S3::Errors::PreconditionFailed
+      return Errors.precondition_failed
+
+    rescue NameError => e
+      # https://github.com/aws/aws-sdk-core-ruby/pull/65
+      raise e unless e.message == "wrong constant name 412Error"
+
+      return Errors.precondition_failed
     end
 
     private
 
-    def hijack(env, path, head)
+    def hijack(env, request, head)
       env['rack.hijack'].call
 
       io = env['rack.hijack_io']
@@ -54,21 +72,22 @@ module S3Proxy
         io.write "Content-Type: #{head.content_type}\r\n"
         io.write "Content-Length: #{head.content_length}\r\n"
         io.write "ETag: #{head.etag}\r\n"
+        io.write "Last-Modified: #{head.last_modified}\r\n"
         io.write "\r\n"
         io.flush
 
-        s3.get_object(path, target: io)
+        s3.get_object(request, target: io)
       ensure
         io.close
       end
       return [200, {}, ['']]
     end
 
-    def gentle(env, path, head)
+    def gentle(env, request, head)
       case env['REQUEST_METHOD']
       when 'GET'
         fiber = Fiber.new do
-          s3.get_object(path) do |chunk|
+          s3.get_object(request) do |chunk|
             Fiber.yield(chunk)
           end
           Fiber.yield(nil)
@@ -86,6 +105,7 @@ module S3Proxy
       headers = {
         'Content-Type' => head.content_type,
         'Content-Length' => head.content_length.to_s,
+        'Last-Modified' => head.last_modified,
         'ETag' => head.etag,
       }
 
@@ -108,6 +128,14 @@ module S3Proxy
 
         def forbidden
           [403, {'Content-Type' => 'text/plain'}, ["forbidden"]]
+        end
+
+        def precondition_failed
+          [412, {'Content-Type' => 'text/plain'}, ["precondition failed"]]
+        end
+
+        def not_modified
+          [304, {'Content-Type' => 'text/plain'}, ["not modified"]]
         end
 
         def unknown(code)
