@@ -8,7 +8,7 @@ module S3Proxy
     end
 
     def call(env)
-      return Errors.method_not_allowed unless env['REQUEST_METHOD'] == 'GET'
+      return Errors.method_not_allowed unless %w(GET HEAD).include?(env['REQUEST_METHOD'])
       return Errors.not_found if env['PATH_INFO'].empty?
 
       # When used as a forward proxy
@@ -18,18 +18,26 @@ module S3Proxy
       else
         _, bucket, key = env['PATH_INFO'].split('/', 3)
       end
+
+      return Errors.not_found unless bucket && key
+
       path = {bucket: bucket, key: key}
 
       head = s3.head_object(path)
+
       return Errors.not_found unless head
 
-      if env['rack.hijack?']
-        hijack env, path, head
-      else
+      case env['REQUEST_METHOD']
+      when 'HEAD'
         gentle env, path, head
+      when 'GET'
+        if env['rack.hijack?']
+          hijack env, path, head
+        else
+          gentle env, path, head
+        end
       end
-
-    rescue Aws::S3::Errors::NoSuchKey
+    rescue Aws::S3::Errors::NoSuchKey, Aws::S3::Errors::NotFound
       return Errors.not_found
     end
 
@@ -57,20 +65,31 @@ module S3Proxy
     end
 
     def gentle(env, path, head)
-      fiber = Fiber.new do
-        s3.get_object(path) do |chunk|
-          Fiber.yield(chunk)
+      case env['REQUEST_METHOD']
+      when 'GET'
+        fiber = Fiber.new do
+          s3.get_object(path) do |chunk|
+            Fiber.yield(chunk)
+          end
+          Fiber.yield(nil)
         end
-        Fiber.yield(nil)
+
+        body = Enumerator.new do |y|
+          while n = fiber.resume
+            y << n
+          end
+        end
+      when 'HEAD'
+        body = ['']
       end
 
-      body = Enumerator.new do |y|
-        while n = fiber.resume
-          y << n
-        end
-      end
+      headers = {
+        'Content-Type' => head.content_type,
+        'Content-Length' => head.content_length.to_s,
+        'ETag' => head.etag,
+      }
 
-      [200, {'Content-Type' => head.content_type, 'Content-Length' => head.content_length.to_s}, body]
+      [200, headers, body]
     end
 
     def s3
