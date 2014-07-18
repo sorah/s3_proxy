@@ -98,11 +98,10 @@ module S3Proxy
       env['rack.hijack'].call
       out = env['rack.hijack_io']
 
-      Net::HTTP.start('s3.amazonaws.com', 443, use_ssl: true) do |http|
-        uri = URI.parse("https://s3.amazonaws.com/#{request[:bucket]}/#{request[:key]}")
-
+      uri = URI.parse("#{endpoint}/#{request[:bucket]}/#{request[:key]}")
+      Net::HTTP.start(uri.host, uri.port, use_ssl: uri.scheme == 'https') do |http|
         req = Net::HTTP::Get.new(uri)
-        #req['Connection'] = 'close'
+        req['Connection'] = 'close'
 
         {
           if_match: 'If-Match'.freeze, if_none_match: 'If-None-Match'.freeze,
@@ -116,7 +115,6 @@ module S3Proxy
         signer.sign_http_request(req)
 
         http.request(req) do |response|
-          p response.to_hash
           begin
             out.write "HTTP/1.1 #{response.code} #{response.message}\r\n"
             out.write "Status: #{response.code}\r\n"
@@ -195,6 +193,10 @@ module S3Proxy
 
     def signer_credential
       @credential ||= @options[:credentials] || Aws::CredentialProviderChain.new(s3.config).resolve
+    end
+
+    def endpoint
+      s3.config.endpoint
     end
 
     module Errors
