@@ -1,7 +1,37 @@
 require 'aws-sdk-core'
 require 'stringio'
+require 'net/http'
+require 'net/https'
+require 'uri'
+require 'aws4_signer'
+
+require 'thread'
+#
+#class Net::BufferedIO
+#  def initialize(io)
+#      @io = io
+#      @read_timeout = 60
+#      @continue_timeout = nil
+#      @debug_output = STDOUT
+#      @rbuf = ''
+#  end
+#
+#  def debug_output=(o)
+#    o
+#  end
+#end
 
 module S3Proxy
+  # https://github.com/aws/aws-sdk-core-ruby/pull/79
+  module AwsInstanceProfileThreadSafe
+    def refresh!
+      (@refresh_mutex ||= Mutex.new).synchronize do
+        super
+      end
+    end
+  end
+  ::Aws::InstanceProfileCredentials.prepend AwsInstanceProfileThreadSafe
+
   class App
     def initialize(options={})
       @options = options
@@ -28,17 +58,20 @@ module S3Proxy
       req[:if_modified_since] = env['HTTP_IF_MODIFIED_SINCE'] if env['HTTP_IF_MODIFIED_SINCE']
       req[:if_unmodified_since] = env['HTTP_IF_UNMODIFIED_SINCE'] if env['HTTP_UNMODIFIED_SINCE']
 
-      head = s3.head_object(req)
-
-      return Errors.not_found unless head
-
       case env['REQUEST_METHOD']
       when 'HEAD'
+        head = s3.head_object(req)
+        return Errors.not_found unless head
+
         gentle env, req, head
       when 'GET'
         if env['rack.hijack?']
-          hijack env, req, head
+          hijack env, req
+
         else
+          head = s3.head_object(req)
+          return Errors.not_found unless head
+
           gentle env, req, head
         end
       end
@@ -61,25 +94,59 @@ module S3Proxy
 
     private
 
-    def hijack(env, request, head)
+    def hijack(env, request)
       env['rack.hijack'].call
+      out = env['rack.hijack_io']
 
-      io = env['rack.hijack_io']
-      begin
-        io.write "HTTP/1.1 200 OK\r\n"
-        io.write "Status: 200\r\n"
-        io.write "Connection: close\r\n"
-        io.write "Content-Type: #{head.content_type}\r\n"
-        io.write "Content-Length: #{head.content_length}\r\n"
-        io.write "ETag: #{head.etag}\r\n"
-        io.write "Last-Modified: #{head.last_modified}\r\n"
-        io.write "\r\n"
-        io.flush
+      Net::HTTP.start('s3.amazonaws.com', 443, use_ssl: true) do |http|
+        uri = URI.parse("https://s3.amazonaws.com/#{request[:bucket]}/#{request[:key]}")
 
-        s3.get_object(request, target: io)
-      ensure
-        io.close
+        req = Net::HTTP::Get.new(uri)
+        #req['Connection'] = 'close'
+
+        {
+          if_match: 'If-Match'.freeze, if_none_match: 'If-None-Match'.freeze,
+          if_modified_since: 'If-Modified-Since'.freeze, if_unmodified_since: 'If-Unmodified-Since'.freeze,
+        }.each do |key, name|
+          req[name] = request[key] if request[key]
+
+        end
+        req.delete 'Accept-Encoding'
+
+        signer.sign_http_request(req)
+
+        http.request(req) do |response|
+          p response.to_hash
+          begin
+            out.write "HTTP/1.1 #{response.code} #{response.message}\r\n"
+            out.write "Status: #{response.code}\r\n"
+            out.write "Connection: close\r\n"
+            out.write "Content-Type: #{response['content-type']}\r\n" if response['content-type']
+            out.write "Content-Length: #{response['content-length']}\r\n" if response['content-length']
+            out.write "Transfer-Encoding: #{response['transfer-encoding']}\r\n" if response['transfer-encoding']
+            out.write "ETag: #{response['etag']}\r\n" if response['etag']
+            out.write "Last-Modified: #{response['last-modified']}\r\n" if response['last-modified']
+            out.write "\r\n"
+
+            # Hijack!
+            buffered_io = response.instance_variable_get(:@socket)
+            if buffered_io.is_a?(Net::BufferedIO)
+              out.write p(buffered_io.instance_variable_get(:@rbuf))
+              io = buffered_io.io
+            else
+              io = buffered_io
+            end
+
+            unless io.closed?
+              IO.copy_stream io, out
+            end
+          ensure
+            out.close unless out.closed?
+          end
+        end
       end
+
+
       return [200, {}, ['']]
     end
 
@@ -114,6 +181,20 @@ module S3Proxy
 
     def s3
       @s3 ||= Aws::S3::Client.new(@options)
+    end
+
+    def signer
+      Aws4Signer.new(
+        signer_credential.access_key_id,
+        signer_credential.secret_access_key,
+        s3.config.region,
+        's3',
+        security_token: signer_credential.session_token
+      )
+    end
+
+    def signer_credential
+      @credential ||= @options[:credentials] || Aws::CredentialProviderChain.new(s3.config).resolve
     end
 
     module Errors
