@@ -129,7 +129,7 @@ module S3Proxy
             # Hijack!
             buffered_io = response.instance_variable_get(:@socket)
             if buffered_io.is_a?(Net::BufferedIO)
-              out.write p(buffered_io.instance_variable_get(:@rbuf))
+              out.write buffered_io.instance_variable_get(:@rbuf)
               io = buffered_io.io
             else
               io = buffered_io
