@@ -113,7 +113,7 @@ module S3Proxy
     end
 
     def s3
-      @s3 ||= Aws::S3.new(@options)
+      @s3 ||= Aws::S3::Client.new(@options)
     end
 
     module Errors
