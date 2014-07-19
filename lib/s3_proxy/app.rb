@@ -27,6 +27,7 @@ module S3Proxy
       req[:if_none_match] = env['HTTP_IF_NONE_MATCH'] if env['HTTP_IF_NONE_MATCH']
       req[:if_modified_since] = env['HTTP_IF_MODIFIED_SINCE'] if env['HTTP_IF_MODIFIED_SINCE']
       req[:if_unmodified_since] = env['HTTP_IF_UNMODIFIED_SINCE'] if env['HTTP_UNMODIFIED_SINCE']
+      req[:range] = env['HTTP_RANGE'] if env['HTTP_RANGE']
 
       head = s3.head_object(req)
 
